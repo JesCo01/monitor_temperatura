@@ -25,7 +25,7 @@ $logPath = Join-Path $scriptDir "registro_temperaturas.csv"
 # Comprobación de permisos de Administrador
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# Auto-instalación de LibreHardwareMonitorLib si no existe
+# 1. Auto-instalación de LibreHardwareMonitorLib si no existe
 if (-not (Test-Path $dllPath)) {
     Write-Host "[INSTALADOR] Descargando LibreHardwareMonitorLib (primera ejecución)..." -ForegroundColor Cyan
     try {
@@ -39,22 +39,38 @@ if (-not (Test-Path $dllPath)) {
         Write-Host "[OK] Librería de sensores instalada correctamente." -ForegroundColor Green
     } catch {
         Write-Host "[AVISO] No se pudo descargar LibreHardwareMonitorLib: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "        El monitor continuará usando los sensores nativos de Windows." -ForegroundColor Gray
     }
 }
 
-# Cargar librería de sensores
+# 2. Cargar librería y auto-instalar driver firmado PawnIO (requerido por LHM v0.9.6 en Win11/HVCI)
 $computer = $null
 if (Test-Path $dllPath) {
     try {
         Get-ChildItem -Path $libDir -Filter "*.dll" | Unblock-File -ErrorAction SilentlyContinue
         Add-Type -Path $dllPath -ErrorAction Stop
+
+        if ($isAdmin -and -not [LibreHardwareMonitor.PawnIo.PawnIo]::IsInstalled) {
+            Write-Host "[INSTALADOR] Instalando driver firmado PawnIO para desbloquear sensores de CPU y Placa..." -ForegroundColor Cyan
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $pawnExe = Join-Path $env:TEMP "PawnIO_setup.exe"
+                $pawnUrl = "https://github.com/namazso/PawnIO.Setup/releases/latest/download/PawnIO_setup.exe"
+                Invoke-WebRequest -Uri $pawnUrl -OutFile $pawnExe -UseBasicParsing
+                Start-Process -FilePath $pawnExe -ArgumentList "-install", "-silent" -Wait -NoNewWindow
+                Remove-Item -Path $pawnExe -Force -ErrorAction SilentlyContinue
+                Write-Host "[OK] Driver PawnIO instalado correctamente." -ForegroundColor Green
+            } catch {
+                Write-Host "[AVISO] No se pudo auto-instalar PawnIO: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+
         $computer = [LibreHardwareMonitor.Hardware.Computer]::new()
         $computer.IsCpuEnabled = $true
         $computer.IsGpuEnabled = $true
         $computer.IsMemoryEnabled = $true
         $computer.IsMotherboardEnabled = $true
         $computer.IsStorageEnabled = $true
+        $computer.IsControllerEnabled = $true
         $computer.Open()
     } catch {
         $computer = $null
@@ -63,19 +79,15 @@ if (Test-Path $dllPath) {
 
 # Detectar información base del hardware dinámicamente
 $hwInfo = @{
-    CpuName = "Procesador Desconocido"
-    MoboName = "Placa Base / Equipo"
+    CpuName         = "Procesador Desconocido"
+    MoboName        = "Placa Base / Equipo"
     GpuFallbackName = "Gráfica Integrada / Estándar"
-    HasNvidiaSmi = [bool](Get-Command "nvidia-smi" -ErrorAction SilentlyContinue)
-    HasHvci = $false
+    HasNvidiaSmi    = [bool](Get-Command "nvidia-smi" -ErrorAction SilentlyContinue)
+    PawnInstalled   = $false
 }
 
 try {
-    $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction SilentlyContinue
-    if ($dg -and $dg.VirtualizationBasedSecurityStatus -eq 2) { $hwInfo.HasHvci = $true }
-} catch {}
-
-try {
+    if ($computer) { $hwInfo.PawnInstalled = [LibreHardwareMonitor.PawnIo.PawnIo]::IsInstalled }
     $proc = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc -and $proc.Name) { $hwInfo.CpuName = $proc.Name.Trim() }
     $bb = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -87,7 +99,7 @@ try {
 # Crear cabecera CSV si no existe
 if (-not (Test-Path $logPath)) {
     try {
-        "Fecha_Hora,CPU_Temp_C,CPU_Carga_Pct,GPU_Nombre,GPU_Temp_C,GPU_Carga_Pct,SSD_Max_Temp_C,RAM_Usada_GB,RAM_Pct,Estado" | Out-File -FilePath $logPath -Encoding utf8
+        "Fecha_Hora,CPU_Temp_C,CPU_Carga_Pct,GPU_Nombre,GPU_Temp_C,GPU_Carga_Pct,SSD_Principal_Temp_C,RAM_Usada_GB,RAM_Pct,Estado" | Out-File -FilePath $logPath -Encoding utf8
     } catch {}
 }
 
@@ -132,46 +144,76 @@ function Obtener-EstadoBadge($temp, $umbral) {
     $val = [double]$temp
     if ($val -ge $umbral) {
         return @{ Texto = "PELIGRO"; Color = "Red"; Icon = "[!]" }
-    } elseif ($val -ge 75) {
+    } elseif ($val -ge ($umbral - 10)) {
         return @{ Texto = "ELEVADO"; Color = "Yellow"; Icon = "[~]" }
     } else {
         return @{ Texto = "NORMAL "; Color = "Green"; Icon = "[OK]" }
     }
 }
 
+function Obtener-SensoresRecursivo($hwItem) {
+    $hwItem.Update()
+    $lista = @()
+    if ($hwItem.Sensors) { $lista += $hwItem.Sensors }
+    if ($hwItem.SubHardware) {
+        foreach ($sub in $hwItem.SubHardware) {
+            $lista += Obtener-SensoresRecursivo $sub
+        }
+    }
+    return $lista
+}
+
 function Leer-Metricas {
     $m = [ordered]@{
-        Fecha       = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        CpuName     = $hwInfo.CpuName
-        MoboName    = $hwInfo.MoboName
-        CpuTempPkg  = $null
-        CpuTempMax  = $null
-        CpuLoad     = $null
-        CpuPower    = $null
-        Gpus        = @()
-        StorageMaxT = $null
-        StorageName = $null
-        RamUsedGB   = $null
-        RamTotalGB  = $null
-        RamPct      = $null
+        Fecha      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        CpuName    = $hwInfo.CpuName
+        MoboName   = $hwInfo.MoboName
+        CpuTempPkg = $null
+        CpuTempMax = $null
+        CpuLoad    = $null
+        CpuPower   = $null
+        MoboTemp   = $null
+        Gpus       = @()
+        Drives     = @()
+        RamUsedGB  = $null
+        RamTotalGB = $null
+        RamPct     = $null
     }
 
     if ($computer) {
         foreach ($hw in $computer.Hardware) {
-            $hw.Update()
             $type = $hw.HardwareType
+            $allSensors = Obtener-SensoresRecursivo $hw
 
             if ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Cpu) {
                 $m.CpuName = $hw.Name
-                foreach ($s in $hw.Sensors) {
-                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1) {
-                        if ($s.Name -eq "CPU Package" -or $s.Name -like "*Package*") { $m.CpuTempPkg = [math]::Round($s.Value, 1) }
-                        if ($s.Name -eq "Core Max" -or $s.Name -like "*Core (Tctl/Tdie)*") { $m.CpuTempMax = [math]::Round($s.Value, 1) }
-                        if ($null -eq $m.CpuTempPkg -and $s.Name -like "*Core*") { $m.CpuTempPkg = [math]::Round($s.Value, 1) }
+                foreach ($s in $allSensors) {
+                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1 -and $s.Value -lt 130) {
+                        if ($s.Name -like "*Distance to TjMax*") { continue }
+                        $val = [math]::Round($s.Value, 1)
+                        if ($s.Name -eq "CPU Package" -or $s.Name -like "*Package*" -or $s.Name -like "*Tctl/Tdie*") {
+                            $m.CpuTempPkg = $val
+                        } elseif ($s.Name -eq "Core Max" -or $s.Name -eq "Core Average") {
+                            if ($null -eq $m.CpuTempMax -or $val -gt $m.CpuTempMax) { $m.CpuTempMax = $val }
+                        } elseif ($s.Name -like "*Core*") {
+                            if ($null -eq $m.CpuTempMax -or $val -gt $m.CpuTempMax) { $m.CpuTempMax = $val }
+                        }
                     } elseif ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Load -and $null -ne $s.Value) {
                         if ($s.Name -eq "CPU Total") { $m.CpuLoad = [math]::Round($s.Value, 1) }
                     } elseif ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Power -and $s.Value -gt 0) {
-                        if ($s.Name -eq "CPU Package") { $m.CpuPower = [math]::Round($s.Value, 1) }
+                        if ($s.Name -eq "CPU Package" -or $s.Name -like "*Package*") { $m.CpuPower = [math]::Round($s.Value, 1) }
+                    }
+                }
+            } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Motherboard) {
+                $m.MoboName = $hw.Name
+                foreach ($s in $allSensors) {
+                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 5 -and $s.Value -lt 120) {
+                        $val = [math]::Round($s.Value, 1)
+                        if ($s.Name -like "*CPU*" -and $null -eq $m.CpuTempPkg) {
+                            $m.CpuTempPkg = $val
+                        } elseif ($null -eq $m.MoboTemp -and ($s.Name -like "*Motherboard*" -or $s.Name -like "*System*" -or $s.Name -eq "Temperature #1")) {
+                            $m.MoboTemp = $val
+                        }
                     }
                 }
             } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::GpuNvidia -or
@@ -185,13 +227,13 @@ function Leer-Metricas {
                     Power    = $null
                     Fan      = $null
                 }
-                foreach ($s in $hw.Sensors) {
+                foreach ($s in $allSensors) {
                     if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1) {
                         if ($s.Name -eq "GPU Core" -or $null -eq $g.TempCore) { $g.TempCore = [math]::Round($s.Value, 1) }
                         if ($s.Name -like "*Memory*") { $g.TempVram = [math]::Round($s.Value, 1) }
                     } elseif ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Load -and $null -ne $s.Value) {
                         if ($s.Name -eq "GPU Core" -or $s.Name -eq "D3D 3D") {
-                            if ($null -eq $g.Load) { $g.Load = [math]::Round($s.Value, 1) }
+                            if ($null -eq $g.Load -or $s.Name -eq "GPU Core") { $g.Load = [math]::Round($s.Value, 1) }
                         }
                     } elseif ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Power -and $s.Value -gt 0) {
                         if ($s.Name -like "*Package*" -or $s.Name -like "*Power*") { $g.Power = [math]::Round($s.Value, 1) }
@@ -201,28 +243,40 @@ function Leer-Metricas {
                 }
                 $m.Gpus += $g
             } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Storage) {
-                foreach ($s in $hw.Sensors) {
-                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1) {
+                $tempMain = $null
+                $tempCtrl = $null
+                foreach ($s in $allSensors) {
+                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1 -and $s.Value -lt 120) {
                         if ($s.Name -like "*Warning*" -or $s.Name -like "*Critical*" -or $s.Name -like "*Limit*" -or $s.Name -like "*Threshold*") {
                             continue
                         }
                         $t = [math]::Round($s.Value, 1)
-                        if ($null -eq $m.StorageMaxT -or $t -gt $m.StorageMaxT) {
-                            $m.StorageMaxT = $t
-                            $m.StorageName = $hw.Name
+                        if ($s.Name -eq "Temperature") {
+                            $tempMain = $t
+                        } else {
+                            if ($null -eq $tempCtrl -or $t -gt $tempCtrl) { $tempCtrl = $t }
                         }
                     }
                 }
+                if ($null -eq $tempMain -and $null -ne $tempCtrl) {
+                    $tempMain = $tempCtrl
+                    $tempCtrl = $null
+                }
+                if ($null -ne $tempMain) {
+                    $m.Drives += [ordered]@{
+                        Name     = $hw.Name
+                        TempMain = $tempMain
+                        TempCtrl = $tempCtrl
+                    }
+                }
             } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Memory -and $hw.Name -eq "Total Memory") {
-                foreach ($s in $hw.Sensors) {
+                foreach ($s in $allSensors) {
                     if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Data -and $s.Name -eq "Memory Used") {
                         $m.RamUsedGB = [math]::Round($s.Value, 1)
                     } elseif ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Load -and $s.Name -eq "Memory") {
                         $m.RamPct = [math]::Round($s.Value, 1)
                     }
                 }
-            } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Motherboard) {
-                $m.MoboName = $hw.Name
             }
         }
     }
@@ -259,6 +313,7 @@ function Leer-Metricas {
         }
     }
 
+    # Fallback ACPI solo para laptops/Surface (ignorando valores fijos falsos de BIOS como 27.8°C / 26.8°C)
     if ($null -eq $m.CpuTempPkg -and $null -eq $m.CpuTempMax -and $isAdmin) {
         try {
             $tz = Get-CimInstance -Namespace "root/wmi" -ClassName "MSAcpi_ThermalZoneTemperature" -ErrorAction SilentlyContinue
@@ -266,7 +321,9 @@ function Leer-Metricas {
                 $temps = @()
                 foreach ($z in $tz) {
                     $c = [math]::Round(($z.CurrentTemperature - 2732) / 10.0, 1)
-                    if ($c -gt 10 -and $c -lt 125) { $temps += $c }
+                    if ($c -gt 15 -and $c -lt 120 -and $c -ne 27.8 -and $c -ne 26.8 -and $c -ne 29.8) {
+                        $temps += $c
+                    }
                 }
                 if ($temps.Count -gt 0) {
                     $m.CpuTempPkg = ($temps | Measure-Object -Maximum).Maximum
@@ -318,16 +375,19 @@ try {
                 $motivoAlerta += " [GPU ($($g.Name)) SOBRECALENTANDO: $($g.TempCore)°C]"
             }
         }
-        if ($null -ne $m.StorageMaxT -and $m.StorageMaxT -ge 75) {
-            $hayAlerta = $true
-            $motivoAlerta += " [SSD/DISCO SOBRECALENTANDO: $($m.StorageMaxT)°C]"
+        foreach ($d in $m.Drives) {
+            if ($null -ne $d.TempMain -and $d.TempMain -ge 75) {
+                $hayAlerta = $true
+                $motivoAlerta += " [SSD ($($d.Name)) SOBRECALENTANDO: $($d.TempMain)°C]"
+            }
         }
 
         # Log en CSV
         try {
             $estadoStr = if ($hayAlerta) { "CRITICO" } else { "NORMAL" }
             $mainGpu = $m.Gpus[0]
-            "$($m.Fecha),$cpuTempRef,$($m.CpuLoad),`"$($mainGpu.Name)`",$($mainGpu.TempCore),$($mainGpu.Load),$($m.StorageMaxT),$($m.RamUsedGB),$($m.RamPct),$estadoStr" | Out-File -FilePath $logPath -Append -Encoding utf8
+            $mainSsdT = if ($m.Drives.Count -gt 0) { $m.Drives[0].TempMain } else { "" }
+            "$($m.Fecha),$cpuTempRef,$($m.CpuLoad),`"$($mainGpu.Name)`",$($mainGpu.TempCore),$($mainGpu.Load),$mainSsdT,$($m.RamUsedGB),$($m.RamPct),$estadoStr" | Out-File -FilePath $logPath -Append -Encoding utf8
         } catch {}
 
         if ($hayAlerta -and -not $SinSonido) {
@@ -345,7 +405,7 @@ try {
         Write-Host ("  Procesador  : {0}" -f $m.CpuName).PadRight(78) -ForegroundColor Gray
         Write-Host ("  Placa/Equipo: {0}" -f $m.MoboName).PadRight(78) -ForegroundColor Gray
         if ($isAdmin) {
-            Write-Host "  Privilegios : MODO ADMINISTRADOR (Acceso completo a todos los sensores)     " -ForegroundColor Green
+            Write-Host "  Privilegios : MODO ADMINISTRADOR (Sensores de hardware desbloqueados)       " -ForegroundColor Green
         } else {
             Write-Host "  Privilegios : MODO NORMAL (Sensores de núcleo CPU requieren Admin)          " -ForegroundColor Yellow
         }
@@ -354,23 +414,31 @@ try {
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkCyan
 
         # CPU
-        $cpuTempStr = if ($null -ne $cpuTempRef) { "$cpuTempRef °C" } else { if ($isAdmin) { if ($hwInfo.HasHvci) { "Bloq. (HVCI)" } else { "Sin sensor" } } else { "Requiere Admin" } }
+        $cpuTempStr = if ($null -ne $cpuTempRef) { "$cpuTempRef °C" } else { if ($isAdmin) { "Sin sensor" } else { "Requiere Admin" } }
         $cpuCargaStr = if ($null -ne $m.CpuLoad) { "$($m.CpuLoad)%" } else { "N/A" }
         $cpuWStr = if ($null -ne $m.CpuPower) { " | $($m.CpuPower)W" } else { "" }
         Write-Host ("  {0,-24} | " -f "CPU Package") -NoNewline
         Write-Host ("{0,-16} | " -f $cpuTempStr) -NoNewline -ForegroundColor $cpuBadge.Color
         Write-Host ("{0} {1,-6} | " -f $cpuBadge.Icon, $cpuBadge.Texto) -NoNewline -ForegroundColor $cpuBadge.Color
-        Write-Host ("Carga: $cpuCargaStr$cpuWStr").PadRight(22) -ForegroundColor Gray
+        Write-Host ("Carga: $cpuCargaStr$cpuWStr").PadRight(24) -ForegroundColor Gray
 
-        if ($null -ne $m.CpuTempMax) {
+        if ($null -ne $m.CpuTempMax -and $m.CpuTempMax -ne $cpuTempRef) {
             $cpuMaxBadge = Obtener-EstadoBadge $m.CpuTempMax $UmbralAlerta
             Write-Host ("  {0,-24} | " -f "CPU Core Max") -NoNewline
             Write-Host ("{0,-16} | " -f "$($m.CpuTempMax) °C") -NoNewline -ForegroundColor $cpuMaxBadge.Color
             Write-Host ("{0} {1,-6} | " -f $cpuMaxBadge.Icon, $cpuMaxBadge.Texto) -NoNewline -ForegroundColor $cpuMaxBadge.Color
-            Write-Host "Núcleo más caliente   " -ForegroundColor Gray
+            Write-Host ("Núcleo más caliente").PadRight(24) -ForegroundColor Gray
         }
 
-        # GPUs (todas las detectadas)
+        if ($null -ne $m.MoboTemp) {
+            $moboBadge = Obtener-EstadoBadge $m.MoboTemp 75
+            Write-Host ("  {0,-24} | " -f "Placa Base (Mainboard)") -NoNewline
+            Write-Host ("{0,-16} | " -f "$($m.MoboTemp) °C") -NoNewline -ForegroundColor $moboBadge.Color
+            Write-Host ("{0} {1,-6} | " -f $moboBadge.Icon, $moboBadge.Texto) -NoNewline -ForegroundColor $moboBadge.Color
+            Write-Host ("Sensor de placa").PadRight(24) -ForegroundColor Gray
+        }
+
+        # GPUs
         foreach ($g in $m.Gpus) {
             $gBadge = Obtener-EstadoBadge $g.TempCore $UmbralAlerta
             $shortName = if ($g.Name.Length -gt 24) { $g.Name.Substring(0, 21) + "..." } else { $g.Name }
@@ -380,25 +448,27 @@ try {
             Write-Host ("  {0,-24} | " -f $shortName) -NoNewline
             Write-Host ("{0,-16} | " -f $gTempStr) -NoNewline -ForegroundColor $gBadge.Color
             Write-Host ("{0} {1,-6} | " -f $gBadge.Icon, $gBadge.Texto) -NoNewline -ForegroundColor $gBadge.Color
-            Write-Host ("Carga: $gCargaStr$gWStr").PadRight(22) -ForegroundColor Gray
+            Write-Host ("Carga: $gCargaStr$gWStr").PadRight(24) -ForegroundColor Gray
 
             if ($null -ne $g.TempVram) {
                 $vBadge = Obtener-EstadoBadge $g.TempVram 95
                 Write-Host ("  {0,-24} | " -f "GPU Memoria (VRAM)") -NoNewline
                 Write-Host ("{0,-16} | " -f "$($g.TempVram) °C") -NoNewline -ForegroundColor $vBadge.Color
                 Write-Host ("{0} {1,-6} | " -f $vBadge.Icon, $vBadge.Texto) -NoNewline -ForegroundColor $vBadge.Color
-                Write-Host "Memoria de video      " -ForegroundColor Gray
+                Write-Host ("Memoria de video").PadRight(24) -ForegroundColor Gray
             }
         }
 
-        # SSD / Disco
-        if ($null -ne $m.StorageMaxT) {
-            $ssdBadge = Obtener-EstadoBadge $m.StorageMaxT 75
-            Write-Host ("  {0,-24} | " -f "Disco / SSD") -NoNewline
-            Write-Host ("{0,-16} | " -f "$($m.StorageMaxT) °C") -NoNewline -ForegroundColor $ssdBadge.Color
+        # Todos los Discos / SSDs detectados
+        foreach ($d in $m.Drives) {
+            $ssdBadge = Obtener-EstadoBadge $d.TempMain 70
+            $dLabel = "SSD: " + $d.Name
+            if ($dLabel.Length -gt 24) { $dLabel = $dLabel.Substring(0, 21) + "..." }
+            $ctrlNote = if ($null -ne $d.TempCtrl -and $d.TempCtrl -ne $d.TempMain) { "Ctrl: $($d.TempCtrl)°C" } else { "Temp. compuesta" }
+            Write-Host ("  {0,-24} | " -f $dLabel) -NoNewline
+            Write-Host ("{0,-16} | " -f "$($d.TempMain) °C") -NoNewline -ForegroundColor $ssdBadge.Color
             Write-Host ("{0} {1,-6} | " -f $ssdBadge.Icon, $ssdBadge.Texto) -NoNewline -ForegroundColor $ssdBadge.Color
-            $sName = if ($m.StorageName.Length -gt 22) { $m.StorageName.Substring(0, 19) + "..." } else { $m.StorageName }
-            Write-Host $sName.PadRight(22) -ForegroundColor Gray
+            Write-Host $ctrlNote.PadRight(24) -ForegroundColor Gray
         }
 
         # RAM
@@ -408,7 +478,7 @@ try {
         Write-Host ("  {0,-24} | " -f "Memoria RAM") -NoNewline
         Write-Host ("{0,-16} | " -f $ramStr) -NoNewline
         Write-Host ("{0} {1,-6} | " -f $ramBadge.Icon, $ramBadge.Texto) -NoNewline -ForegroundColor $ramBadge.Color
-        Write-Host ("Uso: $ramPctStr").PadRight(22) -ForegroundColor Gray
+        Write-Host ("Uso: $ramPctStr").PadRight(24) -ForegroundColor Gray
 
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkCyan
         if ($hayAlerta) {
@@ -420,7 +490,7 @@ try {
         }
 
         if (-not $isAdmin) {
-            Write-Host "  [TIP]: Ejecuta 'iniciar_monitor.bat' como Admin para ver temp de CPU.       " -ForegroundColor Yellow
+            Write-Host "  [TIP]: Ejecuta 'iniciar_monitor.bat' como Admin para instalar/leer CPU.     " -ForegroundColor Yellow
         }
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkCyan
         Write-Host "  [Log] $logPath" -ForegroundColor DarkGray

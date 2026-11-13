@@ -142,16 +142,26 @@ def get_lhm_temps():
         ps_cmd = f"""
         Get-ChildItem -Path '{LIB_DIR}' -Filter '*.dll' | Unblock-File -ErrorAction SilentlyContinue
         Add-Type -Path '{DLL_PATH}'
+        if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -and -not [LibreHardwareMonitor.PawnIo.PawnIo]::IsInstalled) {{
+            try {{
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $pawnExe = Join-Path $env:TEMP 'PawnIO_setup.exe'
+                Invoke-WebRequest -Uri 'https://github.com/namazso/PawnIO.Setup/releases/latest/download/PawnIO_setup.exe' -OutFile $pawnExe -UseBasicParsing
+                Start-Process -FilePath $pawnExe -ArgumentList '-install', '-silent' -Wait -NoNewWindow
+            }} catch {{}}
+        }}
         $c = [LibreHardwareMonitor.Hardware.Computer]::new()
         $c.IsCpuEnabled = $true
         $c.IsGpuEnabled = $true
+        $c.IsMotherboardEnabled = $true
         $c.Open()
         $cpuT = $null; $gpuT = $null
         foreach ($hw in $c.Hardware) {{
             $hw.Update()
+            foreach ($sub in $hw.SubHardware) {{ $sub.Update() }}
             if ($hw.HardwareType -eq [LibreHardwareMonitor.Hardware.HardwareType]::Cpu) {{
                 foreach ($s in $hw.Sensors) {{
-                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1) {{
+                    if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1 -and $s.Value -lt 130 -and $s.Name -notlike '*Distance*') {{
                         if ($s.Name -eq 'CPU Package' -or $null -eq $cpuT) {{ $cpuT = [math]::Round($s.Value, 1) }}
                     }}
                 }}
@@ -168,8 +178,8 @@ def get_lhm_temps():
             try {{
                 $tz = Get-CimInstance -Namespace 'root/wmi' -ClassName 'MSAcpi_ThermalZoneTemperature' -ErrorAction SilentlyContinue
                 if ($tz) {{
-                    $maxAcpi = ($tz | ForEach-Object {{ ($_.CurrentTemperature - 2732) / 10.0 }} | Where-Object {{ $_ -gt 10 -and $_ -lt 125 }} | Measure-Object -Maximum).Maximum
-                    if ($maxAcpi) {{ $cpuT = [math]::Round($maxAcpi, 1) }}
+                    $maxAcpi = ($tz | ForEach-Object {{ [math]::Round(($_.CurrentTemperature - 2732) / 10.0, 1) }} | Where-Object {{ $_ -gt 15 -and $_ -lt 120 -and $_ -ne 27.8 -and $_ -ne 26.8 }} | Measure-Object -Maximum).Maximum
+                    if ($maxAcpi) {{ $cpuT = $maxAcpi }}
                 }}
             }} catch {{}}
         }}
