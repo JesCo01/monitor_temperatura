@@ -67,7 +67,13 @@ $hwInfo = @{
     MoboName = "Placa Base / Equipo"
     GpuFallbackName = "Gráfica Integrada / Estándar"
     HasNvidiaSmi = [bool](Get-Command "nvidia-smi" -ErrorAction SilentlyContinue)
+    HasHvci = $false
 }
+
+try {
+    $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction SilentlyContinue
+    if ($dg -and $dg.VirtualizationBasedSecurityStatus -eq 2) { $hwInfo.HasHvci = $true }
+} catch {}
 
 try {
     $proc = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -197,6 +203,9 @@ function Leer-Metricas {
             } elseif ($type -eq [LibreHardwareMonitor.Hardware.HardwareType]::Storage) {
                 foreach ($s in $hw.Sensors) {
                     if ($s.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $s.Value -gt 1) {
+                        if ($s.Name -like "*Warning*" -or $s.Name -like "*Critical*" -or $s.Name -like "*Limit*" -or $s.Name -like "*Threshold*") {
+                            continue
+                        }
                         $t = [math]::Round($s.Value, 1)
                         if ($null -eq $m.StorageMaxT -or $t -gt $m.StorageMaxT) {
                             $m.StorageMaxT = $t
@@ -345,7 +354,7 @@ try {
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkCyan
 
         # CPU
-        $cpuTempStr = if ($null -ne $cpuTempRef) { "$cpuTempRef °C" } else { if ($isAdmin) { "Sin sensor" } else { "Requiere Admin" } }
+        $cpuTempStr = if ($null -ne $cpuTempRef) { "$cpuTempRef °C" } else { if ($isAdmin) { if ($hwInfo.HasHvci) { "Bloq. (HVCI)" } else { "Sin sensor" } } else { "Requiere Admin" } }
         $cpuCargaStr = if ($null -ne $m.CpuLoad) { "$($m.CpuLoad)%" } else { "N/A" }
         $cpuWStr = if ($null -ne $m.CpuPower) { " | $($m.CpuPower)W" } else { "" }
         Write-Host ("  {0,-24} | " -f "CPU Package") -NoNewline
