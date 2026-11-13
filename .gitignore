@@ -1,0 +1,15 @@
+# Dependencias descargadas automáticamente al iniciar
+lib/
+*.zip
+*.dll
+*.exe
+
+# Logs y datos locales
+*.csv
+*.log
+
+# Python cache y entornos
+__pycache__/
+*.pyc
+venv/
+.venv/

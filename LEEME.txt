@@ -1,0 +1,46 @@
+================================================================================
+  GUÍA RÁPIDA - MONITOR DE TEMPERATURAS Y ESTABILIDAD PARA TRABAJO REMOTO
+================================================================================
+
+Este kit fue preparado específicamente para tu hardware:
+- Procesador : Intel Core Ultra 7 270K Plus (24 núcleos: 8P + 16E)
+- Gráfica    : NVIDIA GeForce RTX 5070 Ti (16 GB VRAM)
+- Placa Base : ASUS Z890 AYW GAMING WIFI W
+- Conexión   : RustDesk / Acceso Remoto Activo
+
+--------------------------------------------------------------------------------
+¿CÓMO USARLO? (3 OPCIONES SEGÚN LO QUE PREFIERAS):
+--------------------------------------------------------------------------------
+
+1. OPCIÓN 1 (RECOMENDADA): MONITOR EN CONSOLA CON ACCESO TOTAL A CPU Y GPU
+   -> Haz doble clic en: iniciar_monitor.bat
+   -> Te pedirá confirmación de Administrador (UAC de Windows).
+   -> ¿Por qué pide Administrador?: En procesadores modernos Intel Ultra 7,
+      Windows restringe el acceso a los sensores térmicos de los núcleos.
+      Con Administrador lee: CPU Package Temp, Core Max, GPU Core, VRAM y RAM.
+
+2. OPCIÓN 2: MONITOR EN MODO NORMAL (SIN PRIVILEGIOS DE ADMIN)
+   -> Haz doble clic en: iniciar_modo_normal.bat
+   -> No pide permisos. Mide la temperatura de la GPU RTX 5070 Ti,
+      el uso total de la CPU y la memoria RAM en tiempo real.
+
+3. OPCIÓN 3: PANEL WEB VISUAL (IDEAL PARA VER DESDE EL MÓVIL U OTRA PANTALLA)
+   -> Haz doble clic en: iniciar_servidor_web.bat
+   -> Abre en cualquier navegador: http://localhost:8080
+   -> Si estás por VPN o en la misma red Wi-Fi, puedes abrirlo desde tu móvil
+      ingresando la IP de tu computador con el puerto :8080.
+
+--------------------------------------------------------------------------------
+CARACTERÍSTICAS Y PROTECCIÓN:
+--------------------------------------------------------------------------------
+- Alerta Sonora y Visual: Si la CPU o GPU superan los 85°C, emitirá un pitido
+  y cambiará el estado a ROJO (CRÍTICO) para advertirte.
+- Historial Automático: Guarda un registro continuo en 'registro_temperaturas.csv'
+  para que puedas revisar si hubo picos de temperatura mientras estabas fuera.
+- Umbrales de Seguridad:
+    * 🟢 Menor a 75°C : NORMAL (Tu PC está totalmente a salvo).
+    * 🟡 75°C a 84°C   : ELEVADA (Bajo carga alta, ventiladores deberían acelerar).
+    * 🔴 85°C o más    : PELIGRO (Riesgo de Thermal Throttling o congelamiento).
+
+Para detener el monitor en cualquier momento: Presiona [Ctrl + C] en la ventana.
+================================================================================
