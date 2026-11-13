@@ -250,6 +250,22 @@ function Leer-Metricas {
         }
     }
 
+    if ($null -eq $m.CpuTempPkg -and $null -eq $m.CpuTempMax -and $isAdmin) {
+        try {
+            $tz = Get-CimInstance -Namespace "root/wmi" -ClassName "MSAcpi_ThermalZoneTemperature" -ErrorAction SilentlyContinue
+            if ($tz) {
+                $temps = @()
+                foreach ($z in $tz) {
+                    $c = [math]::Round(($z.CurrentTemperature - 2732) / 10.0, 1)
+                    if ($c -gt 10 -and $c -lt 125) { $temps += $c }
+                }
+                if ($temps.Count -gt 0) {
+                    $m.CpuTempPkg = ($temps | Measure-Object -Maximum).Maximum
+                }
+            }
+        } catch {}
+    }
+
     if ($null -eq $m.RamPct) {
         try {
             $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
@@ -292,6 +308,10 @@ try {
                 $hayAlerta = $true
                 $motivoAlerta += " [GPU ($($g.Name)) SOBRECALENTANDO: $($g.TempCore)°C]"
             }
+        }
+        if ($null -ne $m.StorageMaxT -and $m.StorageMaxT -ge 75) {
+            $hayAlerta = $true
+            $motivoAlerta += " [SSD/DISCO SOBRECALENTANDO: $($m.StorageMaxT)°C]"
         }
 
         # Log en CSV

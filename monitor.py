@@ -164,6 +164,15 @@ def get_lhm_temps():
             }}
         }}
         $c.Close()
+        if ($null -eq $cpuT) {{
+            try {{
+                $tz = Get-CimInstance -Namespace 'root/wmi' -ClassName 'MSAcpi_ThermalZoneTemperature' -ErrorAction SilentlyContinue
+                if ($tz) {{
+                    $maxAcpi = ($tz | ForEach-Object {{ ($_.CurrentTemperature - 2732) / 10.0 }} | Where-Object {{ $_ -gt 10 -and $_ -lt 125 }} | Measure-Object -Maximum).Maximum
+                    if ($maxAcpi) {{ $cpuT = [math]::Round($maxAcpi, 1) }}
+                }}
+            }} catch {{}}
+        }}
         Write-Output "$cpuT,$gpuT"
         """
         out = subprocess.check_output(
